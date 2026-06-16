@@ -279,6 +279,53 @@ function Test-OUExists {
     return $LogStringBuilder.ToString()
 }
 
+function Test-CheckSrvRecords {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$DomainName
+    )
+    $LogStringBuilder = [System.Text.StringBuilder]::new()
+    $Status = "PASSED"
+    
+    # The kerberos records we need to check
+    $srvRecords = @("_kerberos._tcp.$DomainName", "_kerberos._udp.$DomainName")
+    
+    foreach ($record in $srvRecords) {
+        [void]$LogStringBuilder.AppendLine("Checking SRV record: $record...")
+        try {
+            # Query the DNS for the SRV record
+            $result = Resolve-DnsName -Name $record -Type SRV -ErrorAction Stop
+            
+            if ($result) {
+                # Using regex to verify the target host ends with the domain name
+                $escapedDomain = [regex]::Escape($DomainName)
+                $regexPattern = "(?i).*\.$escapedDomain"
+                $validTargets = $result | Where-Object { $_.NameTarget -match $regexPattern }
+                
+                if ($validTargets) {
+                    [void]$LogStringBuilder.AppendLine("Success: Found valid SRV records for $record")
+                } else {
+                    [void]$LogStringBuilder.AppendLine("Warning: SRV records found, but targets do not match domain suffix: $DomainName")
+                    if ($Status -ne "FAILED") {
+                        $Status = "WARNING"
+                    }
+                }
+            } else {
+                [void]$LogStringBuilder.AppendLine("Warning: No SRV records returned for $record")
+                if ($Status -ne "FAILED") {
+                    $Status = "WARNING"
+                }
+            }
+        } catch {
+            [void]$LogStringBuilder.AppendLine("Error: Could not resolve SRV record for $record. Details: $($_.Exception.Message)")
+            $Status = "FAILED"
+        }
+    }
+    
+    [void]$LogStringBuilder.Append("Status: $Status")
+    return $LogStringBuilder.ToString()
+}
+
 Clear-Host
 
 
@@ -332,6 +379,11 @@ Write-Output $DCReplicationResult
 Write-Host -ForegroundColor Yellow "`n`nSkipping domain controller replication check as only one available on-prem domain controller was found..."
 }
 # End of check for domain controller replication
+
+# Check Kerberos SRV records setup
+Write-Host -ForegroundColor Yellow "`n`nChecking Kerberos SRV records setup..."
+Test-CheckSrvRecords -DomainName $OnPremDomainName
+# End of check for Kerberos SRV records setup
 
 # Check the AD admin account
 Write-Host -ForegroundColor Yellow "`n`nChecking AD admin account status..."
