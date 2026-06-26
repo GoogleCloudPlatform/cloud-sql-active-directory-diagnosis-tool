@@ -493,7 +493,83 @@ function Get-KerberosTicket {
   }
 }
 
+function Test-CheckCloudSqlConnectivity {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string[]]$SQLServerSPNs
+    )
+    $LogStringBuilder = [System.Text.StringBuilder]::new()
+    $Status = "PASSED"
+    
+    foreach ($spn in $SQLServerSPNs) {
+        if ([string]::IsNullOrWhiteSpace($spn)) { continue }
+        
+        [void]$LogStringBuilder.AppendLine("Testing TCP port 1433 connection to Cloud SQL instance at $spn...")
+        
+        try {
+            $connection = Test-NetConnection -ComputerName $spn -Port 1433 -WarningAction SilentlyContinue -InformationAction SilentlyContinue
+            if ($connection.TcpTestSucceeded) {
+                [void]$LogStringBuilder.AppendLine("Connection to $spn on port 1433 successful.")
+            } else {
+                [void]$LogStringBuilder.AppendLine("Connection to $spn on port 1433 failed. Network path is closed or blocked.")
+                $Status = "FAILED"
+            }
+        } catch {
+            [void]$LogStringBuilder.AppendLine("Connection check to $spn failed with error: $($_.Exception.Message)")
+            $Status = "FAILED"
+        }
+    }
+    
+    [void]$LogStringBuilder.Append("Status: $Status")
+    return $LogStringBuilder.ToString()
+}
 
+function Test-CheckSrvRecords {
+    param (
+        [Parameter(Mandatory=$true)]
+        [string]$DomainName
+    )
+    $LogStringBuilder = [System.Text.StringBuilder]::new()
+    $Status = "PASSED"
+    
+    # The kerberos records we need to check
+    $srvRecords = @("_kerberos._tcp.$DomainName", "_kerberos._udp.$DomainName")
+    
+    foreach ($record in $srvRecords) {
+        [void]$LogStringBuilder.AppendLine("Checking SRV record: $record...")
+        try {
+            # Query the DNS for the SRV record
+            $result = Resolve-DnsName -Name $record -Type SRV -ErrorAction Stop
+            
+            if ($result) {
+                # Using regex to verify the target host ends with the domain name
+                $escapedDomain = [regex]::Escape($DomainName)
+                $regexPattern = "(?i).*\.$escapedDomain"
+                $validTargets = $result | Where-Object { $_.NameTarget -match $regexPattern }
+                
+                if ($validTargets) {
+                    [void]$LogStringBuilder.AppendLine("Success: Found valid SRV records for $record")
+                } else {
+                    [void]$LogStringBuilder.AppendLine("Warning: SRV records found, but targets do not match domain suffix: $DomainName")
+                    if ($Status -ne "FAILED") {
+                        $Status = "WARNING"
+                    }
+                }
+            } else {
+                [void]$LogStringBuilder.AppendLine("Warning: No SRV records returned for $record")
+                if ($Status -ne "FAILED") {
+                    $Status = "WARNING"
+                }
+            }
+        } catch {
+            [void]$LogStringBuilder.AppendLine("Error: Could not resolve SRV record for $record. Details: $($_.Exception.Message)")
+            $Status = "FAILED"
+        }
+    }
+    
+    [void]$LogStringBuilder.Append("Status: $Status")
+    return $LogStringBuilder.ToString()
+}
 
 function Run-Tool() {
     Clear-Host
@@ -559,11 +635,31 @@ function Run-Tool() {
     }
     # End of check for SQL Server fully qualified domain name
 
+    # Check connectivity to Cloud SQL instance(s)
+    Write-Host -ForegroundColor Yellow "`n`nChecking connectivity to Cloud SQL instance(s) on port 1433..."
+    $ConnectivityResult = Test-CheckCloudSqlConnectivity -SQLServerSPNs $SQLServerSPNs
+    Write-Output $ConnectivityResult
+    # End of check for connectivity to Cloud SQL instance(s)
+
     # Check DNS server setup
     Write-Host -ForegroundColor Yellow "`n`nChecking domain controller DNS server setup..."
     $DNSResult = Test-CheckDNS -OnPremIPAddresses $OnPremIPAddresses
     Write-Output $DNSResult
     # End of check for DNS setup
+
+    # Check Kerberos SRV records setup
+    Write-Host -ForegroundColor Yellow "`n`nChecking Kerberos SRV records setup..."
+    Write-Output "On-Premises Domain SRV Records:"
+    $SrvRecordResult = Test-CheckSrvRecords -DomainName $OnPremDomainName
+    Write-Output $SrvRecordResult
+    Write-Output "Managed AD Domain SRV Records:"
+    if (![string]::IsNullOrWhiteSpace($ManagedADDomainName)) {
+      $SrvRecordResultManaged = Test-CheckSrvRecords -DomainName $ManagedADDomainName
+      Write-Output $SrvRecordResultManaged
+    } else {
+      Write-Output "Skipping SRV records check as Managed AD domain name was not provided."
+    }
+    # End of check for Kerberos SRV records setup
 
     # Check for domain controller replication
     if ($OnPremIPAddresses.Count -gt 1) {
