@@ -653,8 +653,12 @@ function Run-Tool() {
     $SrvRecordResult = Test-CheckSrvRecords -DomainName $OnPremDomainName
     Write-Output $SrvRecordResult
     Write-Output "Managed AD Domain SRV Records:"
-    $SrvRecordResultManaged = Test-CheckSrvRecords -DomainName $ManagedADDomainName
-    Write-Output $SrvRecordResultManaged
+    if (![string]::IsNullOrWhiteSpace($ManagedADDomainName)) {
+      $SrvRecordResultManaged = Test-CheckSrvRecords -DomainName $ManagedADDomainName
+      Write-Output $SrvRecordResultManaged
+    } else {
+      Write-Output "Skipping SRV records check as Managed AD domain name was not provided."
+    }
     # End of check for Kerberos SRV records setup
 
     # Check for domain controller replication
