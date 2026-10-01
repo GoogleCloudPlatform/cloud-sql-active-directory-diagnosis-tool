@@ -279,6 +279,141 @@ function Test-OUExists {
     return $LogStringBuilder.ToString()
 }
 
+function Get-OUPermissionDecision {
+    # Returns 'Granted', 'Denied', or 'Missing' for a single right, based on the first ACE in the
+    # OU's DACL that allows or denies it to the account. Windows evaluates ACEs in the same order.
+    param(
+        [System.Security.AccessControl.AuthorizationRuleCollection]$Rules,
+        [hashtable]$AccountSids,
+        [System.DirectoryServices.ActiveDirectoryRights]$Right,
+        # The object class or property set that the right is for. An empty GUID means all of them.
+        [Guid]$ObjectType = [Guid]::Empty,
+        # The class of child objects that the right must apply to. An empty GUID means the OU itself.
+        [Guid]$ChildClass = [Guid]::Empty
+    )
+
+    foreach ($Rule in $Rules) {
+        if (-not $AccountSids.ContainsKey($Rule.IdentityReference.Value)) { continue }
+        if (([int]$Rule.ActiveDirectoryRights -band [int]$Right) -ne [int]$Right) { continue }
+        if ($Rule.ObjectType -ne [Guid]::Empty -and $Rule.ObjectType -ne $ObjectType) { continue }
+
+        if ($ChildClass -eq [Guid]::Empty) {
+            # Inherit-only ACEs apply to child objects, but not to the OU itself.
+            if ([int]$Rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        } else {
+            # The ACE must be inherited by child objects of this class.
+            if (-not ([int]$Rule.InheritanceFlags -band [int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit)) { continue }
+            if ($Rule.InheritedObjectType -ne [Guid]::Empty -and $Rule.InheritedObjectType -ne $ChildClass) { continue }
+        }
+
+        if ($Rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) {
+            return 'Denied'
+        }
+        return 'Granted'
+    }
+
+    return 'Missing'
+}
+
+function Test-OUPermissions {
+    # Checks that the AD admin account has the permissions on the OU that Cloud SQL requires:
+    # https://cloud.google.com/sql/docs/sqlserver/cmad#before-you-begin
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$OrganizationalUnitDN,
+        [Parameter(Mandatory=$true)]
+        [string]$SamAccountName
+    )
+
+    $LogStringBuilder = [System.Text.StringBuilder]::new()
+    $Status = "FAILED"
+
+    # schemaIDGUIDs of the computer and user classes, and the rightsGuid of the "Reset Password"
+    # extended right. These GUIDs are the same in every AD forest.
+    $ObjectClasses = [ordered]@{
+        'Computer' = [Guid]'bf967a86-0de6-11d0-a285-00aa003049e2'
+        'User' = [Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
+    }
+    $UserClass = $ObjectClasses['User']
+    $ResetPassword = [Guid]'00299570-246d-11d0-a768-00aa006e0529'
+
+    try {
+        $User = Get-ADUser -Identity $SamAccountName -ErrorAction Stop
+        # tokenGroups is a constructed attribute that AD only computes for Base-scope searches.
+        $User = Get-ADUser -SearchBase $User.DistinguishedName -SearchScope Base -LDAPFilter '(objectClass=*)' -Properties tokenGroups -ErrorAction Stop
+        $OUObject = Get-ADOrganizationalUnit -Identity $OrganizationalUnitDN -Properties nTSecurityDescriptor -ErrorAction Stop
+        $Rules = $OUObject.nTSecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    } catch {
+        [void]$LogStringBuilder.AppendLine("Could not read the account or the OU permissions. $($_.Exception.Message)")
+        [void]$LogStringBuilder.Append('Status: {0}' -f $Status)
+        return $LogStringBuilder.ToString()
+    }
+
+    # Permissions can be granted to the account, to any group that it's a member of (including
+    # nested groups), or to Everyone and Authenticated Users.
+    $AccountSids = @{ 'S-1-1-0' = $true; 'S-1-5-11' = $true }
+    $AccountSids[$User.SID.Value] = $true
+    foreach ($GroupSid in $User.tokenGroups) {
+        if ($GroupSid -is [byte[]]) {
+            $GroupSid = [System.Security.Principal.SecurityIdentifier]::new($GroupSid, 0)
+        }
+        $AccountSids[$GroupSid.ToString()] = $true
+    }
+
+    # tokenGroups always includes the account's primary group, so an empty list means that it couldn't be read.
+    $CouldNotReadGroups = ($User.tokenGroups.Count -eq 0)
+    if ($CouldNotReadGroups) {
+        [void]$LogStringBuilder.AppendLine("Could not read the group memberships of '$SamAccountName'. Permissions granted through groups aren't included.")
+    }
+
+    $Acl = @{ Rules = $Rules; AccountSids = $AccountSids }
+    $Results = [ordered]@{}
+    foreach ($ClassName in $ObjectClasses.Keys) {
+        $Class = $ObjectClasses[$ClassName]
+
+        $Results["Create $ClassName objects"] = Get-OUPermissionDecision @Acl -Right CreateChild -ObjectType $Class
+
+        # Deleting a child object requires Delete Child on the OU, or Delete on the object itself.
+        $Delete = Get-OUPermissionDecision @Acl -Right DeleteChild -ObjectType $Class
+        if ($Delete -ne 'Granted' -and (Get-OUPermissionDecision @Acl -Right Delete -ObjectType $Class -ChildClass $Class) -eq 'Granted') {
+            $Delete = 'Granted'
+        }
+        $Results["Delete $ClassName objects"] = $Delete
+    }
+
+    # Cloud SQL sets the password, account flags, and SPNs of the user account that it creates in the
+    # OU, so these permissions must be inherited by user objects. They aren't needed for computer
+    # objects, because AD grants the account that creates a computer object the permissions that
+    # Cloud SQL needs on it.
+    $Results["Write All Properties on User objects"] = Get-OUPermissionDecision @Acl -Right WriteProperty -ChildClass $UserClass
+    $Results["Reset password on User objects"] = Get-OUPermissionDecision @Acl -Right ExtendedRight -ObjectType $ResetPassword -ChildClass $UserClass
+
+    foreach ($Permission in $Results.Keys) {
+        [void]$LogStringBuilder.AppendLine(('{0}: {1}' -f $Permission, $Results[$Permission]))
+    }
+
+    $Decisions = @($Results.Values)
+    if ($Decisions -notcontains 'Missing' -and $Decisions -notcontains 'Denied') {
+        $Status = "PASSED"
+    } else {
+        if ($Decisions -contains 'Missing') {
+            [void]$LogStringBuilder.AppendLine("Use the Delegation of Control Wizard on the OU to grant the missing permissions to '$SamAccountName'.")
+        }
+        if ($Decisions -contains 'Denied') {
+            [void]$LogStringBuilder.AppendLine("Remove the Deny permission entries on the OU that apply to '$SamAccountName' or its groups.")
+        }
+        [void]$LogStringBuilder.AppendLine("See https://cloud.google.com/sql/docs/sqlserver/cmad#before-you-begin")
+
+        # Without group memberships, permissions granted through groups might have been missed.
+        if ($CouldNotReadGroups) {
+            $Status = "WARNING"
+        }
+    }
+
+    [void]$LogStringBuilder.Append('Status: {0}' -f $Status)
+    return $LogStringBuilder.ToString()
+}
+
 function Test-CheckSrvRecords {
     param (
         [Parameter(Mandatory=$true)]
@@ -395,5 +530,10 @@ Write-Host -ForegroundColor Yellow "`n`nChecking if OU exists..."
 Test-OUExists -OrganizationalUnitDN $OU
 # End of check for OU
 
+# Check the OU permissions delegated to the AD admin account
+Write-Host -ForegroundColor Yellow "`n`nChecking OU permissions delegated to the AD admin account..."
+Test-OUPermissions -OrganizationalUnitDN $OU -SamAccountName $AdminAccount
+# End of check for OU permissions
 
-Write-Host -ForegroundColor Yellow ("`n`nActive Directory diagnosis complete. Refer to the following doc on how to resolve any of the above failures - {0}" -f "https://cloud.google.com/sql/docs/sqlserver/ad-diagnosis-tool") 
+
+Write-Host -ForegroundColor Yellow ("`n`nActive Directory diagnosis complete. Refer to the following doc on how to resolve any of the above failures - {0}" -f "https://cloud.google.com/sql/docs/sqlserver/cmad-diagnosis-tool")
